@@ -301,10 +301,13 @@ class GKDTrainer(SFTTrainer):
         """
         Compute the windowed generalized Jensen-Shannon Divergence loss for knowledge distillation.
 
-        Instead of aligning token-by-token probability distributions, this method aligns joint probabilities
-        over sliding windows of consecutive tokens. This captures local coherence and dependencies within
-        token sequences, providing a smoother learning signal that allows the student model more flexibility
-        in how it generates text while maintaining semantic consistency.
+        For each sliding window of consecutive token positions, the student and teacher probability
+        distributions are averaged over the positions in the window, and the standard generalized JSD
+        is computed on these averaged distributions. This provides softer alignment: the student only
+        needs to match the teacher's average distribution over the window rather than at each individual
+        token position, giving the student more flexibility in how it generates text within a window.
+
+        When window_size=1, this reduces exactly to the standard token-level generalized_jsd_loss.
 
         Args:
             student_logits:
@@ -312,8 +315,8 @@ class GKDTrainer(SFTTrainer):
             teacher_logits:
                 Tensor of shape (batch_size, sequence_length, vocab_size)
             labels:
-                Tensor of shape (batch_size, sequence_length) with -100 for padding tokens to ignore when computing
-                loss
+                Tensor of shape (batch_size, sequence_length) with -100 for padding tokens to ignore when
+                computing loss
             beta:
                 Interpolation coefficient between 0 and 1 (default: 0.5)
             temperature:
@@ -327,126 +330,73 @@ class GKDTrainer(SFTTrainer):
 
         Returns:
             loss: Scalar tensor with the windowed generalized JSD loss
-
-        Note:
-            When window_size=1, this reduces to standard token-level generalized_jsd_loss.
-            Each token may appear in multiple overlapping windows and thus receives gradients from multiple
-            loss terms, which can provide stronger supervision for tokens in the middle of sequences.
         """
         batch_size, seq_len, _ = student_logits.shape
 
-        # Apply temperature scaling
-        student_logits = student_logits / temperature
-        teacher_logits = teacher_logits / temperature
+        # Compute probabilities with temperature scaling
+        student_probs = F.softmax(student_logits / temperature, dim=-1)  # [B, L, V]
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)  # [B, L, V]
 
-        # Compute log probabilities
-        student_log_probs = F.log_softmax(student_logits, dim=-1)  # [B, L, V]
-        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)  # [B, L, V]
-
-        # Create mask for valid tokens (not padding)
+        # Create float mask for valid (non-padding) tokens
         if labels is not None:
-            valid_mask = (labels != -100)  # [B, L]
+            valid_mask = (labels != -100).float()  # [B, L]
         else:
-            valid_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=student_logits.device)
+            valid_mask = torch.ones(batch_size, seq_len, dtype=student_probs.dtype, device=student_probs.device)
 
-        # Gather log probabilities for the actual tokens from labels
-        # We need to get the log prob of each token that was actually generated
-        if labels is not None:
-            # Clone labels and replace -100 with 0 for gathering (will be masked anyway)
-            labels_for_gather = labels.clone()
-            labels_for_gather[labels == -100] = 0
-
-            # Gather token log probs: [B, L, V] -> [B, L]
-            student_token_log_probs = torch.gather(
-                student_log_probs, dim=-1, index=labels_for_gather.unsqueeze(-1)
-            ).squeeze(-1)
-            teacher_token_log_probs = torch.gather(
-                teacher_log_probs, dim=-1, index=labels_for_gather.unsqueeze(-1)
-            ).squeeze(-1)
-        else:
-            # If no labels, use argmax (though this is not typical for training)
-            token_ids = student_logits.argmax(dim=-1)
-            student_token_log_probs = torch.gather(
-                student_log_probs, dim=-1, index=token_ids.unsqueeze(-1)
-            ).squeeze(-1)
-            teacher_token_log_probs = torch.gather(
-                teacher_log_probs, dim=-1, index=token_ids.unsqueeze(-1)
-            ).squeeze(-1)
-
-        # Mask invalid tokens by setting their log probs to 0 (they won't contribute to window sums)
-        student_token_log_probs = student_token_log_probs * valid_mask.float()
-        teacher_token_log_probs = teacher_token_log_probs * valid_mask.float()
-
-        # Create sliding windows and compute window-level joint log probabilities
         window_losses = []
         window_counts = []
 
         for start_idx in range(0, seq_len - window_size + 1, window_stride):
             end_idx = start_idx + window_size
 
-            # Extract windows
-            window_student_log_probs = student_token_log_probs[:, start_idx:end_idx]  # [B, W]
-            window_teacher_log_probs = teacher_token_log_probs[:, start_idx:end_idx]  # [B, W]
             window_mask = valid_mask[:, start_idx:end_idx]  # [B, W]
+            valid_counts = window_mask.sum(dim=1, keepdim=True)  # [B, 1]
+            has_valid = valid_counts.squeeze(-1) > 0  # [B]
 
-            # Count valid tokens in each window
-            valid_tokens_per_window = window_mask.sum(dim=1)  # [B]
-
-            # Skip windows with no valid tokens
-            has_valid_tokens = valid_tokens_per_window > 0
-            if not has_valid_tokens.any():
+            if not has_valid.any():
                 continue
 
-            # Compute joint log probabilities by summing over the window (log of product = sum of logs)
-            # This gives us the joint probability of the token sequence in the window
-            student_window_joint_log_prob = window_student_log_probs.sum(dim=1)  # [B]
-            teacher_window_joint_log_prob = window_teacher_log_probs.sum(dim=1)  # [B]
+            # Average probability distributions over valid positions in the window
+            # [B, W, V] * [B, W, 1] -> sum over W -> [B, V], divided by count of valid positions
+            window_student_probs = student_probs[:, start_idx:end_idx, :]  # [B, W, V]
+            window_teacher_probs = teacher_probs[:, start_idx:end_idx, :]  # [B, W, V]
 
-            # Now compute generalized JSD on these joint probabilities
-            # These are already log probabilities (sums of log probs), so we treat them as log-space values
+            avg_student_probs = (window_student_probs * window_mask.unsqueeze(-1)).sum(dim=1) / valid_counts  # [B, V]
+            avg_teacher_probs = (window_teacher_probs * window_mask.unsqueeze(-1)).sum(dim=1) / valid_counts  # [B, V]
+
+            # Convert to log space for JSD computation
+            avg_student_log = torch.log(avg_student_probs + 1e-10)
+            avg_teacher_log = torch.log(avg_teacher_probs + 1e-10)
+
+            # Compute generalized JSD — identical formula to generalized_jsd_loss
             if beta == 0:
-                # Forward KL: KL(student || teacher)
-                window_jsd = student_window_joint_log_prob - teacher_window_joint_log_prob
+                jsd = F.kl_div(avg_student_log, avg_teacher_log, reduction="none", log_target=True)
             elif beta == 1:
-                # Reverse KL: KL(teacher || student)
-                window_jsd = teacher_window_joint_log_prob - student_window_joint_log_prob
+                jsd = F.kl_div(avg_teacher_log, avg_student_log, reduction="none", log_target=True)
             else:
-                # Generalized JSD
-                # Convert back to probability space for mixture
-                student_window_prob = torch.exp(student_window_joint_log_prob)
-                teacher_window_prob = torch.exp(teacher_window_joint_log_prob)
+                beta_tensor = torch.tensor(beta, dtype=avg_student_log.dtype, device=avg_student_log.device)
+                mixture_log = torch.logsumexp(
+                    torch.stack([avg_student_log + torch.log1p(-beta_tensor), avg_teacher_log + torch.log(beta_tensor)]),
+                    dim=0,
+                )
+                kl_teacher = F.kl_div(mixture_log, avg_teacher_log, reduction="none", log_target=True)
+                kl_student = F.kl_div(mixture_log, avg_student_log, reduction="none", log_target=True)
+                jsd = beta_tensor * kl_teacher + (1 - beta_tensor) * kl_student
 
-                # Mixture distribution
-                beta_tensor = torch.tensor(beta, dtype=student_window_prob.dtype, device=student_window_prob.device)
-                mixture_prob = (1 - beta_tensor) * student_window_prob + beta_tensor * teacher_window_prob
-                mixture_log_prob = torch.log(mixture_prob + 1e-10)  # Add small epsilon for numerical stability
-
-                # Compute KL divergences
-                kl_teacher = teacher_window_joint_log_prob - mixture_log_prob
-                kl_student = student_window_joint_log_prob - mixture_log_prob
-
-                # Generalized JSD
-                window_jsd = beta_tensor * kl_teacher + (1 - beta_tensor) * kl_student
-
-            # Mask out windows with no valid tokens
-            window_jsd = window_jsd * has_valid_tokens.float()
+            # Sum over vocab -> [B], zero out batch items with no valid tokens
+            window_jsd = jsd.sum(dim=-1) * has_valid.float()
 
             window_losses.append(window_jsd)
-            window_counts.append(has_valid_tokens.float())
+            window_counts.append(has_valid.float())
 
-        # If no valid windows were found, return zero loss
         if len(window_losses) == 0:
             return torch.tensor(0.0, device=student_logits.device, requires_grad=True)
 
-        # Stack all window losses
         all_window_losses = torch.stack(window_losses)  # [num_windows, B]
         all_window_counts = torch.stack(window_counts)  # [num_windows, B]
 
-        # Apply reduction
         if reduction == "batchmean":
-            total_loss = all_window_losses.sum()
-            total_count = all_window_counts.sum()
-            return total_loss / (total_count + 1e-10)
+            return all_window_losses.sum() / (all_window_counts.sum() + 1e-10)
         elif reduction == "sum":
             return all_window_losses.sum()
         elif reduction == "mean":
@@ -558,6 +508,7 @@ class GKDTrainer(SFTTrainer):
                     teacher_logits=shifted_teacher_logits,
                     labels=shifted_labels,
                     beta=self.beta,
+                    temperature=self.temperature,
                 )
 
         # empty cache
