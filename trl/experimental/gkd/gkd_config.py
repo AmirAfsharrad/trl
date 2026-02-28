@@ -50,6 +50,18 @@ class GKDConfig(SFTConfig):
         seq_kd (`bool`, *optional*, defaults to `False`):
             Seq_kd parameter that controls whether to perform Sequence-Level KD (can be viewed as supervised FT on
             teacher-generated output).
+        use_windowed_loss (`bool`, *optional*, defaults to `False`):
+            Whether to use windowed GKD loss that aligns joint probabilities over sliding windows of tokens instead
+            of individual token-level alignment. When enabled, the loss is computed over sequences of consecutive
+            tokens to capture local coherence and dependencies.
+        window_size (`int`, *optional*, defaults to `5`):
+            Number of consecutive tokens per window when `use_windowed_loss` is enabled. A window_size of 1 reduces
+            to standard token-level distillation. Larger values capture longer-range dependencies but increase
+            computational cost.
+        window_stride (`int`, *optional*, defaults to `1`):
+            Step size for the sliding window when `use_windowed_loss` is enabled. A stride of 1 means fully
+            overlapping windows (each token appears in multiple windows). Larger strides reduce computational cost
+            but provide less dense supervision.
     """
 
     _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["teacher_model_init_kwargs"]
@@ -102,6 +114,27 @@ class GKDConfig(SFTConfig):
             "FT on teacher-generated output)."
         },
     )
+    use_windowed_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use windowed GKD loss that aligns joint probabilities over sliding windows of tokens "
+            "instead of individual token-level alignment."
+        },
+    )
+    window_size: int = field(
+        default=5,
+        metadata={
+            "help": "Number of consecutive tokens per window when `use_windowed_loss` is enabled. A window_size of 1 "
+            "reduces to standard token-level distillation."
+        },
+    )
+    window_stride: int = field(
+        default=1,
+        metadata={
+            "help": "Step size for the sliding window when `use_windowed_loss` is enabled. A stride of 1 means fully "
+            "overlapping windows."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -110,3 +143,10 @@ class GKDConfig(SFTConfig):
             raise ValueError("lmbda must be in the range [0.0, 1.0].")
         if self.beta < 0.0 or self.beta > 1.0:
             raise ValueError("beta must be in the range [0.0, 1.0].")
+        # check windowing parameters
+        if self.window_size < 1:
+            raise ValueError("window_size must be at least 1.")
+        if self.window_stride < 1:
+            raise ValueError("window_stride must be at least 1.")
+        if self.use_windowed_loss and self.window_stride > self.window_size:
+            raise ValueError("window_stride cannot be greater than window_size.")
