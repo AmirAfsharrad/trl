@@ -361,8 +361,9 @@ class GKDTrainer(SFTTrainer):
             window_student_probs = student_probs[:, start_idx:end_idx, :]  # [B, W, V]
             window_teacher_probs = teacher_probs[:, start_idx:end_idx, :]  # [B, W, V]
 
-            avg_student_probs = (window_student_probs * window_mask.unsqueeze(-1)).sum(dim=1) / valid_counts  # [B, V]
-            avg_teacher_probs = (window_teacher_probs * window_mask.unsqueeze(-1)).sum(dim=1) / valid_counts  # [B, V]
+            safe_counts = valid_counts.clamp(min=1)  # avoid 0/0 NaN for fully-masked batch items
+            avg_student_probs = (window_student_probs * window_mask.unsqueeze(-1)).sum(dim=1) / safe_counts  # [B, V]
+            avg_teacher_probs = (window_teacher_probs * window_mask.unsqueeze(-1)).sum(dim=1) / safe_counts  # [B, V]
 
             # Convert to log space for JSD computation
             avg_student_log = torch.log(avg_student_probs + 1e-10)
